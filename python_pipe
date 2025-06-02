@@ -1,0 +1,237 @@
+import pymssql as pymssql
+import pyodbc as pyodbc
+import pandas as pd 
+from sqlalchemy import create_engine 
+
+
+def main():
+
+    connection()
+    table()
+    sync()
+    delete()
+    
+def connection():
+    # Source Database Connection 
+    source_conn = pymssql.connect("DESKTOP-MVMN2S6\\SQLDEVELOPER", "sa", "123Slavica!", "ADRepl") 
+    source_cursor = source_conn.cursor(as_dict=True)
+    # Destination Database Connection 
+    dest_conn = pymssql.connect("DESKTOP-MVMN2S6\\SQLExpress", "sa", "123Slavica!") 
+    dest_cursor = dest_conn.cursor() 
+    # Verify Data (Optional) 
+    source_cursor.execute("SELECT * FROM DimDepartmentGroup WHERE DepartmentGroupKey = 1") 
+    for row in source_cursor: 
+        # print("DepartmentGroupKey=%d, ParentDepartmentGroupKey=%d, DepartmentGroupName=%s" % (row['DepartmentGroupKey'], row['ParentDepartmentGroupKey'], row['DepartmentGroupName'])) 
+        print(f"DepartmentGroupKey={row['DepartmentGroupKey'] or 0}, ParentDepartmentGroupKey={row['ParentDepartmentGroupKey'] or 0}, DepartmentGroupName={row['DepartmentGroupName']}")
+
+    # Close Connections 
+    source_conn.close() 
+    dest_conn.close() 
+    # Destination Database Connection 
+    # ... (connection details) # Destination Database Connection 
+    dest_conn = pymssql.connect("DESKTOP-MVMN2S6\\SQLExpress", "sa", "123Slavica!") 
+    dest_cursor = dest_conn.cursor() 
+    # Disable autocommit 
+    dest_conn.autocommit(True) 
+    # to create and attach database 
+    try:
+        dest_cursor.execute(""" IF EXISTS (SELECT name FROM master.dbo.sysdatabases WHERE name = N'ADRepl2') 
+                                BEGIN EXEC sp_attach_db @dbname = N'ADRepl2', @filename1 = N'C:\\Program Files\\Microsoft SQL Server\\MSSQL16.SQLEXPRESS\\MSSQL\\DATA\\ADRepl2.mdf', @filename2 = N'C:\\Program Files\\Microsoft SQL Serve\\MSSQL16.SQLEXPRESS\\MSSQL\\DATA\\ADRepl2_log.ldf'; 
+                                SELECT 'Database already exists and has been attached' AS Message; 
+                                END 
+                                ELSE 
+                                BEGIN CREATE DATABASE [ADRepl2]; SELECT 'ADRepl2 is Created' AS Message; 
+                                END """)
+    except:
+        print("Database already exists and has been attached") 
+    # Re-enable autocommit (if needed) 
+    dest_conn.autocommit(False) 
+    dest_conn.close() 
+
+
+def table():
+    # Source Database Connection
+    source_conn = pymssql.connect("DESKTOP-MVMN2S6\\SQLDEVELOPER", "sa", "123Slavica!", "ADRepl")
+    source_cursor = source_conn.cursor(as_dict=True)
+
+    # Destination Database Connection
+    dest_conn = pymssql.connect("DESKTOP-MVMN2S6\\SQLExpress", "sa", "123Slavica!", "ADRepl2")
+    dest_cursor = dest_conn.cursor()
+
+    # Step 1: Extract Data from Source Table
+    source_cursor.execute("SELECT * FROM DimDepartmentGroup")
+    data = source_cursor.fetchall()
+
+    # Optional: Convert to a DataFrame for easier manipulation (if needed)
+    df = pd.DataFrame(data)
+
+    # Step 2: Create Table in Destination Database
+    dest_cursor.execute("""
+    IF OBJECT_ID('DimDepartmentGroup', 'U') IS NULL
+    BEGIN
+        CREATE TABLE DimDepartmentGroup (
+            DepartmentGroupKey INT PRIMARY KEY,
+            ParentDepartmentGroupKey INT,
+            DepartmentGroupName NVARCHAR(50)
+        )
+    END
+    """)
+
+    # Step 3: Insert Data into Destination Table wont insert anything for the first time 
+    # because of WHERE NOT EXISTS clause, must fix it
+    for row in data:
+        dest_cursor.execute("""
+            INSERT INTO DimDepartmentGroup (DepartmentGroupKey, ParentDepartmentGroupKey, DepartmentGroupName)
+            SELECT %s, %s, %s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM DimDepartmentGroup WHERE DepartmentGroupKey = %d
+            )
+        """, (row['DepartmentGroupKey'], row['ParentDepartmentGroupKey'], row['DepartmentGroupName'], row['DepartmentGroupKey']))
+
+    # Commit the transaction
+    dest_conn.commit()
+
+    # Verify Data Transfer (Optional)
+    dest_cursor.execute("SELECT * FROM DimDepartmentGroup")
+    for row in dest_cursor:
+        print(row, "copy of the table")
+
+    # Close Connections
+    source_conn.close()
+    dest_conn.close()
+
+def sync():
+    # Connection to the source database
+    source_conn = pymssql.connect("DESKTOP-MVMN2S6\\SQLDEVELOPER", "sa", "123Slavica!", "ADRepl")
+    source_cursor = source_conn.cursor(as_dict=True)
+    # Connection to the destination database
+    dest_conn = pymssql.connect("DESKTOP-MVMN2S6\\SQLExpress", "sa", "123Slavica!", "ADRepl2")
+    dest_cursor = dest_conn.cursor()
+
+    
+    # copy the source table content
+    source_cursor.execute("SELECT * FROM DimDepartmentGroup")
+    data = source_cursor.fetchall()
+
+    # Optional: Convert to a DataFrame for easier manipulation (if needed)
+    df = pd.DataFrame(data)
+
+    source_conn.close()
+    source_cursor.close()
+
+    # in the destination database create temp table
+    dest_cursor.execute("""
+    IF OBJECT_ID('TempTable', 'U') IS NULL
+    BEGIN
+        CREATE TABLE TempTable (
+            DepartmentGroupKey INT PRIMARY KEY,
+            ParentDepartmentGroupKey INT,
+            DepartmentGroupName NVARCHAR(50)
+        )
+    END
+    """)
+    # load the content in the temp table if table is created for the first time content is not loaded
+    # because of WHERE NOT EXISTS clause, must be fixed. Actually we dont need it since we are dropping 
+    # Temp Table and recreating it again from scratch
+    for row in data:
+            dest_cursor.execute("""
+            INSERT INTO TempTable (DepartmentGroupKey, ParentDepartmentGroupKey, DepartmentGroupName)
+            SELECT %s, %s, %s
+            FROM DimDepartmentGroup WHERE DepartmentGroupKey = %d
+        """, (row['DepartmentGroupKey'], row['ParentDepartmentGroupKey'], row['DepartmentGroupName'], row['DepartmentGroupKey']))
+
+    # Commit the transaction
+    dest_conn.commit()
+    # print temp table
+     # Verify Data Transfer (Optional)
+    dest_cursor.execute("SELECT * FROM TempTable")
+    for row in dest_cursor:
+        print(row, "temp table")
+    # merge with the destination database table content
+    dest_cursor.execute("""
+    MERGE INTO DimDepartmentGroup AS Dest
+    USING TempTable AS Temp
+    ON Dest.DepartmentGroupKey = Temp.DepartmentGroupKey
+    WHEN MATCHED THEN
+        UPDATE SET 
+            Dest.ParentDepartmentGroupKey = Temp.ParentDepartmentGroupKey, 
+            Dest.DepartmentGroupName = Temp.DepartmentGroupName
+    WHEN NOT MATCHED THEN
+        INSERT (DepartmentGroupKey, ParentDepartmentGroupKey, DepartmentGroupName)
+        VALUES (Temp.DepartmentGroupKey, Temp.ParentDepartmentGroupKey, Temp.DepartmentGroupName);
+""")
+    
+    # Fetch and print temporary table contents before dropping it
+    dest_cursor.execute("SELECT * FROM TempTable")
+    rows = dest_cursor.fetchall()
+
+    #print temp table before dropping
+    if rows:
+        print("Contents of TempTable before dropping:")
+        for row in rows:
+            print(row)
+    else:
+        print("Temporary table is empty or was not created properly.")
+
+     # drop temp table
+    dest_cursor.execute("""
+    DROP TABLE TempTable
+    """)
+    # close connections
+    dest_conn.commit()
+    dest_cursor.close()
+    dest_conn.close()
+    print("tables are synced")
+
+
+def delete():
+#Updates rows in the destination table to mark them as deleted if they are no longer in the source table
+ # Connection to the source database
+    source_conn = pymssql.connect("DESKTOP-MVMN2S6\\SQLDEVELOPER", "sa", "123Slavica!", "ADRepl")
+    source_cursor = source_conn.cursor(as_dict=True)
+    # Connection to the destination database
+    dest_conn = pymssql.connect("DESKTOP-MVMN2S6\\SQLExpress", "sa", "123Slavica!", "ADRepl2")
+    dest_cursor = dest_conn.cursor()
+
+    # Step 1: Extract Data from Source Table
+    source_cursor.execute("SELECT DepartmentGroupKey FROM DimDepartmentGroup")
+    data = source_cursor.fetchall()
+
+    dest_cursor.execute("""
+           IF OBJECT_ID('TempTable', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE TempTable (
+                        DepartmentGroupKey INT PRIMARY KEY
+                    )
+                END
+                """)
+    print ("temp table is created")
+    # load the primary keys in the temp table 
+    for row in data:
+            dest_cursor.execute("""
+                INSERT INTO TempTable (DepartmentGroupKey)
+                VALUES (%d)
+                """, (row['DepartmentGroupKey'],))
+            
+    source_conn.close()
+    source_cursor.close()
+
+    # Update rows in the destination table that are NOT present in the temporary keys table ---
+    dest_cursor.execute("""
+            DELETE FROM DimDepartmentGroup
+            WHERE DepartmentGroupKey NOT IN (SELECT DepartmentGroupKey FROM TempTable);
+            """)
+    
+    #Drop the temporary keys table ---
+    dest_cursor.execute("""
+                        DROP TABLE TempTable
+                        """)
+    
+    dest_conn.commit()
+    dest_cursor.close()
+    dest_conn.close()
+    print(f"Deleted rows in 'DimDepartmentGroup' updated based on source_table.")
+   
+     
+if __name__ == "__main__":
+    main()
